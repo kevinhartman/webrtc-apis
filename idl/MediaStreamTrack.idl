@@ -129,6 +129,12 @@ namespace org
       [event]
       void onFrameRateChanged(float frameRate);
 
+      /// <summary>
+      /// Event that returns a decoded raw frame
+      /// (in frames per second).
+      /// </summary>
+      [event]
+      void onRawFrame(std::list<byte> yPlane, int yPitch, std::list <byte> uPlane, int uPitch, std::list <byte> vPlane, int vPitch, int width, int height);
     };
   }
 }
