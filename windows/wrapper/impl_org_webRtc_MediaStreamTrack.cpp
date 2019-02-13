@@ -433,18 +433,18 @@ void WrapperImplType::notifyWebrtcObserverFrame(
     auto frameBuffer = frame.video_frame_buffer()->GetI420();
     auto width = frame.width();
     auto height = frame.height();
+    auto strideY = frameBuffer->StrideY() * height;
+    auto strideU = frameBuffer->StrideU() * ((height + 1) / 2);
+    auto strideV = frameBuffer->StrideV() * ((height + 1) / 2);
 
     onRawFrame(std::make_shared<std::list<uint8_t>>(
-                   frameBuffer->DataY(),
-                   frameBuffer->DataY() + frameBuffer->StrideY()),
+                   frameBuffer->DataY(), frameBuffer->DataY() + strideY),
                frameBuffer->StrideY(),
                std::make_shared<std::list<uint8_t>>(
-                   frameBuffer->DataU(),
-                   frameBuffer->DataU() + frameBuffer->StrideU()),
+                   frameBuffer->DataU(), frameBuffer->DataU() + strideU),
                frameBuffer->StrideU(),
                std::make_shared<std::list<uint8_t>>(
-                   frameBuffer->DataV(),
-                   frameBuffer->DataV() + frameBuffer->StrideV()),
+                   frameBuffer->DataV(), frameBuffer->DataV() + strideV),
                frameBuffer->StrideV(), width, height);
   }
 }
