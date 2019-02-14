@@ -251,8 +251,7 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
     ComPtr<IMFAttributes> sampleAttributes;
     sample.sample_.As(&sampleAttributes);
     if (sampleAttributes) {
-        sampleAttributes->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
-        sampleAttributes->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
+      sampleAttributes->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
     }
 
     LONGLONG durationHns = (LONGLONG)((1.0 / kFramerate) * 1000 * 1000 * 10);
