@@ -28,45 +28,8 @@ using zsLib::Seconds;
 using zsLib::Milliseconds;
 using zsLib::AutoRecursiveLock;
 
-//-----------------------------------------------------------------------------
-static bool isSampleIDR(IMFSample* sample)
-{
-  ZS_ASSERT(nullptr != sample);
-
-  ComPtr<IMFMediaBuffer> pBuffer;
-  sample->GetBufferByIndex(0, &pBuffer);
-  BYTE* pBytes{};
-  DWORD maxLength{};
-  DWORD curLength{};
-  if (FAILED(pBuffer->Lock(&pBytes, &maxLength, &curLength))) return false;
-
-  bool found{};
-
-  // Search for the beginnings of nal units.
-  for (DWORD i = 0; i < curLength - 5; ++i)
-  {
-    BYTE* ptr = pBytes + i;
-
-    if ((0x00 != ptr[0]) || (0x00 != ptr[1])) continue;
-
-    int prefixLengthFound = 0;
-
-    if ((0x00 == ptr[2]) && (0x01 == ptr[3]))
-      prefixLengthFound = 4;
-    else if (0x01 == ptr[2])
-      prefixLengthFound = 3;
-    else continue;
-
-    if (0x05 != (ptr[prefixLengthFound] & 0x1f)) continue;
-
-    // Found IDR NAL unit
-    pBuffer->Unlock();
-    found = true;
-    break;
-  }
-  pBuffer->Unlock();
-  return found;
-}
+// TODO: un-hardcode
+static const uint32_t kFramerate = 30;
 
 //-----------------------------------------------------------------------------
 MediaStreamSource::MediaStreamSource(const make_private &) :
@@ -101,17 +64,9 @@ void MediaStreamSource::init(const CreationProperties &props) noexcept
     defaultSubscription_ = subscriptions_.subscribe(props.delegate_, zsLib::IMessageQueueThread::singletonUsingCurrentGUIThreadsMessageQueue());
   }
 
-  winrt::Windows::Media::MediaProperties::VideoEncodingProperties properties {nullptr};
-  switch (frameType_) {
-    case VideoFrameType::VideoFrameType_H264: {
-      properties = winrt::Windows::Media::MediaProperties::VideoEncodingProperties::CreateH264();
-      break;
-    }
-    case VideoFrameType::VideoFrameType_I420: {
-      properties = winrt::Windows::Media::MediaProperties::VideoEncodingProperties::CreateUncompressed(winrt::Windows::Media::MediaProperties::MediaEncodingSubtypes::Nv12(), 10, 10);
-      break;
-    }
-  }
+  winrt::Windows::Media::MediaProperties::VideoEncodingProperties properties =
+      winrt::Windows::Media::MediaProperties::VideoEncodingProperties::CreateUncompressed(
+          winrt::Windows::Media::MediaProperties::MediaEncodingSubtypes::Nv12(), 10, 10);
 
   lastWidth_ = 720;
   lastHeight_ = 1280;
@@ -123,7 +78,7 @@ void MediaStreamSource::init(const CreationProperties &props) noexcept
   descriptor_ = winrt::Windows::Media::Core::VideoStreamDescriptor(properties);
   descriptor_.EncodingProperties().Width(lastWidth_);
   descriptor_.EncodingProperties().Height(lastHeight_);
-  descriptor_.EncodingProperties().FrameRate().Numerator(30);
+  descriptor_.EncodingProperties().FrameRate().Numerator(kFramerate);
   descriptor_.EncodingProperties().FrameRate().Denominator(1);
 
   source_ = winrt::Windows::Media::Core::MediaStreamSource(descriptor_);
@@ -192,37 +147,15 @@ void MediaStreamSource::notifyFrame(const webrtc::VideoFrame &frame) noexcept
   data.width_ = frame.width();
   data.height_ = frame.height();
   data.rotation_ = frame.rotation();
-  data.renderTime_ = static_cast<decltype(data.renderTime_)>(frame.render_time_ms()) * decltype(data.renderTime_)(10000); // 1000 * 10 => 100s nanosecond
-
-  switch (frameType_) {
-    case VideoFrameType::VideoFrameType_I420:
-    {
-      data.frame_ = std::make_unique<webrtc::VideoFrame>(frame.video_frame_buffer(), frame.rotation(), frame.timestamp());
-      data.isIDR_ = true;
-      break;
-    }
-    case VideoFrameType::VideoFrameType_H264:
-    {
-      auto frameBuffer = static_cast<webrtc::NativeHandleBuffer*>(frame.video_frame_buffer().get());
-      if (!frameBuffer) return;
-
-      IMFSample* tmpSample = (IMFSample*)frameBuffer->native_handle();
-      if (!tmpSample) return;
-
-      tmpSample->AddRef();
-      data.sample_.Attach(tmpSample);
-
-      if (isSampleIDR(tmpSample)) {
-        data.isIDR_ = true;
-
-        ComPtr<IMFAttributes> sampleAttributes;
-        data.sample_.As(&sampleAttributes);
-
-        // sampleAttributes->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
-        sampleAttributes->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
-      }
-      break;
-    }
+  data.isIDR_ = true;
+  data.frame_ = std::make_unique<webrtc::VideoFrame>(
+      frame.video_frame_buffer(), frame.timestamp(), frame.render_time_ms(),
+      frame.rotation());
+  
+  if (!makeI420Sample(data)) {
+    RTC_LOG(LS_ERROR) << "MediaStreamSource::notifyFrame() failed to enqueue. "
+                         "Frame will be dropped.";
+    return;
   }
 
   putInQueue(std::move(dataPtr));
@@ -235,69 +168,16 @@ void MediaStreamSource::putInQueue(SampleDataUniPtr sample) noexcept
 {
   {
     AutoRecursiveLock lock(lock_);
-
-    if (sample->isIDR_) {
-      ++totalIDRFramesInQueue_;
-      putIDRIntoQueue_ = true;
-    } else {
-      // reject sample if it's not an IDR and no IDR frames have ever been put in
-      if (!putIDRIntoQueue_) return;
-    }
     queue_.push(std::move(sample));
-
-    // if a deferral is installed then flush only after the deferral is resolved
-    if (!requestingSampleDeferral_) {
-      flushQueueOfExcessiveIDRs();
-    }
   }
 
   pendingRequestRespondToRequestedFrame();
 }
 
 //-----------------------------------------------------------------------------
-void MediaStreamSource::flushQueueOfExcessiveIDRs() noexcept
-{
-  // WARNING: MUST ALREADY BE IN A LOCK
-
-  // no need to pop if there is only one IDR frame in the queue
-  if (totalIDRFramesInQueue_ < 2) return;
-
-  // cannot flush more than 2 frames as a "look ahead" frame is needed to calculates the sample duration
-  if (queue_.size() < 3) return;
-
-  // do not pop if the front sample is not an IDR
-  if (!queue_.front()->isIDR_) return;
-
-  size_t totalEndOfQueueIDRs = (queue_.back()->isIDR_ ? 1 : 0);
-
-  // never allow more than one IDR frame in the queue at a time
-  bool popping{};
-  while (((totalIDRFramesInQueue_ - totalEndOfQueueIDRs) > 1) && (queue_.size() > 2)) {
-    popping = true;
-    popFromQueue();
-  }
-
-  if (popping) {
-    // pop until the next IDR is found
-    do {
-      {
-        auto &frontSample = queue_.front();
-        if (frontSample->isIDR_) break;
-      }
-      popFromQueue();
-    } while (true);
-  }
-}
-
-//-----------------------------------------------------------------------------
 void MediaStreamSource::popFromQueue() noexcept
 {
-  {
-    auto &sample = queue_.front();
-    if (sample->isIDR_) {
-      --totalIDRFramesInQueue_;
-    }
-  }
+  AutoRecursiveLock lock(lock_);
   queue_.pop();
 }
 
@@ -358,49 +238,34 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
   {
     AutoRecursiveLock lock(lock_);
 
-    // must be at least 2 frames in the queue to be able to dequeue any single frame
-    if (queue_.size() < 2) return result;
+    if (queue_.empty()) return result;
 
     result = std::move(queue_.front());
     queue_.pop();
 
+    auto dequeueTimeMs = rtc::TimeMillis(); // now
+
     auto &sample = *result;
-    auto &lookAheadSample = *(queue_.front());
 
-    if (0 == firstRenderTime_) firstRenderTime_ = sample.renderTime_; // zero base the sample time
-    sample.renderTime_ -= firstRenderTime_;
-    sample.renderTime_ += 45;
-
-    switch (frameType_) {
-      case VideoFrameType::VideoFrameType_I420:
-      {
-        // Only make full I420 frame when actually dequeing to prevent
-        // unneeded conversions where some I420 frames may end up being dropped.
-        if (!makeI420Sample(sample)) {
-          result.reset();
-          return result;
-        }
-
-        ComPtr<IMFAttributes> sampleAttributes;
-        sample.sample_.As(&sampleAttributes);
-        if (sampleAttributes) {
-          sampleAttributes->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
-          sampleAttributes->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
-        }
-        LONGLONG duration = (LONGLONG)((1.0 / 30) * 1000 * 1000 * 10);
-        sample.sample_->SetSampleDuration(duration);
-        break;
-      }
-      case VideoFrameType::VideoFrameType_H264:
-      {
-        sample.renderTime_ = 0;
-        sample.sample_->SetSampleDuration(lookAheadSample.renderTime_ - sample.renderTime_);
-        break;
-      }
+    ComPtr<IMFAttributes> sampleAttributes;
+    sample.sample_.As(&sampleAttributes);
+    if (sampleAttributes) {
+      sampleAttributes->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
     }
 
+    LONGLONG durationHns = (LONGLONG)((1.0 / kFramerate) * 1000 * 1000 * 10);
 
-    sample.sample_->SetSampleTime(sample.renderTime_);
+    // In the ideal case, queue size == 1 at all times, meaning Media Element is consuming
+    // frames as quickly as the decoder produces them. To achieve this, we divide the usual
+    // duration (1/fps) by the size of the queue.
+    durationHns = durationHns / (queue_.size() + 1);
+    sample.sample_->SetSampleDuration(durationHns);
+
+    // Setting the sample time to the dequeue time seems to work well for media element.
+    // The rational is this should cause the current sample to follow exactly after
+    // the previous one, even if the previous sample had a shortened duration, allowing
+    // the queue to catch up / drain. In practice, this may not be why this works.
+    sample.sample_->SetSampleTime(dequeueTimeMs * 10000);
 
     ++totalFrameCounted_;
     frameRateChange = updateFrameRate();
@@ -423,8 +288,6 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
       props.Width(sample.width_);
       props.Height(sample.height_);
     }
-
-    flushQueueOfExcessiveIDRs();
   }
 
   if (frameRateChange) fireFrameRateChanged();
@@ -560,7 +423,7 @@ void MediaStreamSource::notifyStartCompleteIfReady() noexcept
 
   {
     AutoRecursiveLock lock(lock_);
-    if (totalIDRFramesInQueue_ < 1) return; // not ready
+    if (queue_.size() < 1) return; // not ready
 
     startingDeferral = startingDeferral_;
     startingDeferral_ = nullptr;
