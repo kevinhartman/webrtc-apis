@@ -147,15 +147,16 @@ void MediaStreamSource::notifyFrame(const webrtc::VideoFrame &frame) noexcept
   data.width_ = frame.width();
   data.height_ = frame.height();
   data.rotation_ = frame.rotation();
-
-  using RenderTime = decltype(data.renderTime_);
-  data.renderTime_ =
-      static_cast<RenderTime>(frame.render_time_ms()) * (RenderTime)(10000);  // 1000 * 10 => 100s nanosecond
-
-  // TODO: is anyone using the fields of this struct? This isn't the right constructor,
-  // since frame.timestamp() is 90Khz rtp.
-  data.frame_ = std::make_unique<webrtc::VideoFrame>(frame.video_frame_buffer(), frame.rotation(), frame.timestamp());
   data.isIDR_ = true;
+  data.frame_ = std::make_unique<webrtc::VideoFrame>(
+      frame.video_frame_buffer(), frame.timestamp(), frame.render_time_ms(),
+      frame.rotation());
+  
+  if (!makeI420Sample(data)) {
+    RTC_LOG(LS_ERROR) << "MediaStreamSource::notifyFrame() failed to enqueue. "
+                         "Frame will be dropped.";
+    return;
+  }
 
   putInQueue(std::move(dataPtr));
 
@@ -246,11 +247,6 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
 
     auto &sample = *result;
     sample.renderTime_ = dequeueTimeMs;
-
-    if (!makeI420Sample(sample)) {
-        result.reset();
-        return result;
-    }
 
     ComPtr<IMFAttributes> sampleAttributes;
     sample.sample_.As(&sampleAttributes);
