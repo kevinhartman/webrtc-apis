@@ -238,7 +238,7 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
   {
     AutoRecursiveLock lock(lock_);
 
-    if (queue_.size() < 1) return result;
+    if (queue_.empty()) return result;
 
     result = std::move(queue_.front());
     queue_.pop();
