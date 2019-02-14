@@ -246,7 +246,6 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
     auto dequeueTimeMs = rtc::TimeMillis(); // now
 
     auto &sample = *result;
-    sample.renderTime_ = dequeueTimeMs;
 
     ComPtr<IMFAttributes> sampleAttributes;
     sample.sample_.As(&sampleAttributes);

@@ -42,7 +42,6 @@ namespace webrtc
       DimensionType width_ {};
       DimensionType height_ {};
       RotationType rotation_ {};
-      RenderTime renderTime_ {};
       bool isIDR_ {};
     };
 
