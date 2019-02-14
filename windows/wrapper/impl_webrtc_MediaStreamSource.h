@@ -69,7 +69,6 @@ namespace webrtc
 
   private:
     void putInQueue(SampleDataUniPtr sample) noexcept;
-    void flushQueueOfExcessiveIDRs() noexcept;
     void popFromQueue() noexcept;
 
     void pendingRequestRespondToRequestedFrame() noexcept;
@@ -116,8 +115,6 @@ namespace webrtc
 
     winrt::event_token stoppingToken_ {};
 
-    bool putIDRIntoQueue_{};
-
     size_t totalFrameCounted_ {};
 
     std::atomic_bool firedResolutionChange_{};
@@ -132,10 +129,7 @@ namespace webrtc
     float lastAverageFrameRate_ {};
     zsLib::Time lastTimeChecked_ {};
 
-    RenderTime firstRenderTime_ {};
-
     SampleDataQueue queue_;
-    size_t totalIDRFramesInQueue_ {};
   };
 
 }
