@@ -28,6 +28,9 @@ using zsLib::Seconds;
 using zsLib::Milliseconds;
 using zsLib::AutoRecursiveLock;
 
+// TODO: un-hardcode
+static const uint32_t kFramerate = 30;
+
 //-----------------------------------------------------------------------------
 static bool isSampleIDR(IMFSample* sample)
 {
@@ -123,7 +126,7 @@ void MediaStreamSource::init(const CreationProperties &props) noexcept
   descriptor_ = winrt::Windows::Media::Core::VideoStreamDescriptor(properties);
   descriptor_.EncodingProperties().Width(lastWidth_);
   descriptor_.EncodingProperties().Height(lastHeight_);
-  descriptor_.EncodingProperties().FrameRate().Numerator(30);
+  descriptor_.EncodingProperties().FrameRate().Numerator(kFramerate);
   descriptor_.EncodingProperties().FrameRate().Denominator(1);
 
   source_ = winrt::Windows::Media::Core::MediaStreamSource(descriptor_);
@@ -192,11 +195,16 @@ void MediaStreamSource::notifyFrame(const webrtc::VideoFrame &frame) noexcept
   data.width_ = frame.width();
   data.height_ = frame.height();
   data.rotation_ = frame.rotation();
-  data.renderTime_ = static_cast<decltype(data.renderTime_)>(frame.render_time_ms()) * decltype(data.renderTime_)(10000); // 1000 * 10 => 100s nanosecond
+
+  using RenderTime = decltype(data.renderTime_);
+  data.renderTime_ =
+      static_cast<RenderTime>(frame.render_time_ms()) * (RenderTime)(10000);  // 1000 * 10 => 100s nanosecond
 
   switch (frameType_) {
     case VideoFrameType::VideoFrameType_I420:
     {
+      // TODO: is anyone using the fields of this struct? This isn't the right constructor,
+      // since frame.timestamp() is 90Khz rtp.
       data.frame_ = std::make_unique<webrtc::VideoFrame>(frame.video_frame_buffer(), frame.rotation(), frame.timestamp());
       data.isIDR_ = true;
       break;
@@ -244,49 +252,9 @@ void MediaStreamSource::putInQueue(SampleDataUniPtr sample) noexcept
       if (!putIDRIntoQueue_) return;
     }
     queue_.push(std::move(sample));
-
-    // if a deferral is installed then flush only after the deferral is resolved
-    if (!requestingSampleDeferral_) {
-      flushQueueOfExcessiveIDRs();
-    }
   }
 
   pendingRequestRespondToRequestedFrame();
-}
-
-//-----------------------------------------------------------------------------
-void MediaStreamSource::flushQueueOfExcessiveIDRs() noexcept
-{
-  // WARNING: MUST ALREADY BE IN A LOCK
-
-  // no need to pop if there is only one IDR frame in the queue
-  if (totalIDRFramesInQueue_ < 2) return;
-
-  // cannot flush more than 2 frames as a "look ahead" frame is needed to calculates the sample duration
-  if (queue_.size() < 3) return;
-
-  // do not pop if the front sample is not an IDR
-  if (!queue_.front()->isIDR_) return;
-
-  size_t totalEndOfQueueIDRs = (queue_.back()->isIDR_ ? 1 : 0);
-
-  // never allow more than one IDR frame in the queue at a time
-  bool popping{};
-  while (((totalIDRFramesInQueue_ - totalEndOfQueueIDRs) > 1) && (queue_.size() > 2)) {
-    popping = true;
-    popFromQueue();
-  }
-
-  if (popping) {
-    // pop until the next IDR is found
-    do {
-      {
-        auto &frontSample = queue_.front();
-        if (frontSample->isIDR_) break;
-      }
-      popFromQueue();
-    } while (true);
-  }
 }
 
 //-----------------------------------------------------------------------------
@@ -387,20 +355,30 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
           sampleAttributes->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
           sampleAttributes->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
         }
-        LONGLONG duration = (LONGLONG)((1.0 / 30) * 1000 * 1000 * 10);
-        sample.sample_->SetSampleDuration(duration);
+
+        LONGLONG durationHns = (LONGLONG)((1.0 / kFramerate) * 1000 * 1000 * 10);
+
+        // In the ideal case, queue size == 1 at all times, meaning Media Element is consuming
+        // frames as quickly as the decoder produces them. To achieve this, we divide the usual
+        // duration (1/fps) by the size of the queue.
+        durationHns = durationHns / (queue_.size());
+        sample.sample_->SetSampleDuration(durationHns);
+
+        // Setting the sample time to the dequeue time seems to work well for media element.
+        // The rational is this should cause the current sample to follow exactly after
+        // the previous one, even if the previous sample had a shortened duration, allowing
+        // the queue to catch up / drain. In practice, this may not be why this works.
+        sample.sample_->SetSampleTime(rtc::TimeMillis() * 10000);
         break;
       }
       case VideoFrameType::VideoFrameType_H264:
       {
         sample.renderTime_ = 0;
         sample.sample_->SetSampleDuration(lookAheadSample.renderTime_ - sample.renderTime_);
+        sample.sample_->SetSampleTime(sample.renderTime_);
         break;
       }
     }
-
-
-    sample.sample_->SetSampleTime(sample.renderTime_);
 
     ++totalFrameCounted_;
     frameRateChange = updateFrameRate();
@@ -423,8 +401,6 @@ MediaStreamSource::SampleDataUniPtr MediaStreamSource::dequeue() noexcept
       props.Width(sample.width_);
       props.Height(sample.height_);
     }
-
-    flushQueueOfExcessiveIDRs();
   }
 
   if (frameRateChange) fireFrameRateChanged();
